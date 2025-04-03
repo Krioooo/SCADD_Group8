@@ -4,7 +4,6 @@ import torch
 import numpy as np
 import utils.exercises1_1 as ex1_1
 import matplotlib.pyplot as plt
-import seaborn as sns
 
 class MonteCarloSDE:
     def __init__(self, H, M, C, D, R, sigma, T, N):

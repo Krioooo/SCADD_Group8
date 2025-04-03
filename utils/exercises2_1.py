@@ -30,6 +30,7 @@ class Soft_LQR:
         self.time_grid = torch.linspace(0, T, N+1)
         self.tau = tau
         self.gamma = gamma
+        self.D_eff = self.D + self.tau / (2 * (self.gamma ** 2)) * torch.eye(2)
         self.S_values = self.solve_riccati_ode()
 
     def riccati_ode(self, t, S_flat):
@@ -70,8 +71,7 @@ class Soft_LQR:
 
         # 第三部分：(T-t)C_{D,tau, gamma}
         # C_{D,tau, gamma} = -tau ln(tau^{m/2}/gamma^{m} * det(∑)^{1/2}), ∑-1 = D+tau/(2*gamma^2)I
-        var_matirx = self.D + self.tau / (2 * (self.gamma ** 2)) * torch.eye(2)
-        inv_matrix = torch.linalg.inv(var_matirx)
+        inv_matrix = torch.linalg.inv(self.D_eff)
         det_matrix = torch.det(inv_matrix)
         C = - self.tau * torch.log((self.tau / self.gamma ** 2) * torch.sqrt(det_matrix))
         entropic = (self.T - t) * C
@@ -84,10 +84,9 @@ class Soft_LQR:
         S_t = self.get_nearest_S(t)
         S_t = torch.tensor(S_t, dtype=torch.float32)
         # mean
-        inv_term = self.D + self.tau / (2 * (self.gamma ** 2)) * torch.eye(2)
-        mean_control = -torch.linalg.inv(inv_term) @ self.M.T @ S_t @ x
+        mean_control = -torch.linalg.inv(self.D_eff) @ self.M.T @ S_t @ x
         # covarian
-        cov_control = self.tau * inv_term
+        cov_control = self.tau * self.D_eff
         # distribution
         control_dist = MultivariateNormal(mean_control, cov_control)
         return control_dist
@@ -106,11 +105,10 @@ class Soft_LQR:
             S_tn = torch.tensor(S_tn, dtype = torch.float32)
 
             # mean
-            inv_term = self.D + self.tau / (2 * (self.gamma ** 2)) * torch.eye(2)
-            mean_control = -torch.linalg.inv(inv_term) @ self.M.T @ S_tn @ x_tn     
+            mean_control = -torch.linalg.inv(self.D_eff) @ self.M.T @ S_tn @ x_tn     
             
             # covarian
-            cov_control = self.tau * inv_term
+            cov_control = self.tau * self.D_eff
 
             # distribution
             control_dist = MultivariateNormal(mean_control, cov_control)
