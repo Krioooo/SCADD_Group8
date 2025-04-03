@@ -125,7 +125,7 @@ def error_on_M(H, M, C, D, R, sigma, T, N_fixed, M_samples_list, v, t0, x0):
 
 def loglog_plot(x, y, fixed_para, change_para):
     plt.figure(figsize = (12, 4))
-    plt.loglog(x, y, 'o-', label = f'Week Error')
+    plt.loglog(x, y, 'o-', label = f'Weak Error')
     # 添加参考线，斜率为 -1
     if change_para == 'N':
         C = y[0] * x[0]  # 选择合适的比例常数 C
