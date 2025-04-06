@@ -6,14 +6,16 @@ import numpy as np
 class LQR:
     def __init__(self, H, M, C, D, R, sigma, T, N):
         """
-        初始化 LQR 类
+        Initialize LQR class
 
         Parameters:
-        H, M, C, D, R: 线性二次调节器的矩阵
-        sigma: 噪声项
-        T: 终止时间
-        N: 时间步长
-        # time_grid: 时间网格 (numpy array)
+            H, M, C, D, R: Matrix of linear quadratic regulator
+            sigma: Noise term
+            T: Terminal time
+            N: The number of time steps
+            dt: time steps
+            time_grid: Time grid
+            S_values: The solution of Ricatti ODE
         """
         self.H = H
         self.M = M
@@ -23,77 +25,137 @@ class LQR:
         self.sigma = sigma
         self.T = T
         self.N = N
-        self.time_grid = torch.linspace(0, T, N+1)
-        self.S_values = self.solve_riccati_ode()
+        self.dt = T/N
+        self.time_grid = torch.linspace(0, T, N + 1)
+        self.S_values = self.solve_ricatti_ode()
 
-    def riccati_ode(self, t, S_flat):
-        """Riccati ODE 求解函数，转换为向量形式"""
-        S = torch.tensor(S_flat, dtype = torch.float32).reshape(2,2) # 2x2 矩阵
+    def ricatti_ode(self, t, S_flat):
+        """
+        Obtain the expression of Riccati ODE: 
+            S'(t) = S(t) M D^{-1} M^{T} S(t) - H^{T} S(t) - S(t) H - C , S(T) = R
+        
+        Input:
+            t: current time
+            S_flat: S value at time t
+        output:
+            S_dot.flatten(): Solve the derivative of S and convert to one dimension
+        """
+        # Reshape S for 2x2 matrix
+        S = torch.tensor(S_flat, dtype = torch.float32).reshape(2,2)
+        # Compute the derivative of S(t)
         S_dot = S @ self.M @ torch.linalg.inv(self.D) @ self.M.T @ S - self.H.T @ S - S @ self.H - self.C
+        
         return S_dot.flatten()
 
-    def solve_riccati_ode(self):
-        """使用 solve_ivp 求解 Riccati ODE"""
-        S_T = self.R.flatten()  # 终止条件 S(T) = R
-        indices = torch.arange(self.time_grid.size(0) - 1, -1, -1)  # 生成倒序索引
-        time_grid_re = torch.index_select(self.time_grid, 0, indices)
-        sol = solve_ivp(self.riccati_ode, [self.T, 0], S_T, t_eval = time_grid_re, atol = 1e-10, rtol = 1e-10)  # 逆向求解
-        S_matrices = sol.y.T[::-1].reshape(-1, 2, 2)  # 转换回矩阵格式
-        return dict(zip(tuple(self.time_grid.tolist()), S_matrices))
+    def solve_ricatti_ode(self):
+        """
+        Use solve_ivp to solve Ricatti ODE 
+
+        Output:
+            Return a dictionary with corresponding time and S values one by one
+        """
+        # Terminal S
+        S_T = self.R.flatten() 
+        # Generate reverse index
+        index = torch.arange(self.time_grid.size(0) - 1, -1, -1)
+        # Reverse time grid
+        time_grid_re = torch.index_select(self.time_grid, 0, index)
+
+        # Solve Ricatti ODE
+        sol = solve_ivp(self.ricatti_ode, [self.T, 0], S_T, t_eval = time_grid_re, atol = 1e-10, rtol = 1e-10)  
+        # Convert back to matrix format
+        S_matrix = sol.y.T[::-1].reshape(-1, 2, 2) 
+
+        return dict(zip(tuple(self.time_grid.tolist()), S_matrix))
 
     def get_nearest_S(self, t):
-        """找到最近的 S(t)"""
+        """
+        Find the value of S that is closest to t
+
+        Input:
+            t: time
+        Output:
+            self.S_values[nearest_t.item()]: S(t) that is closest to t
+        """
+        # Find the nearest t
         nearest_t = self.time_grid[torch.argmin(torch.abs(self.time_grid - t))]
+        
         return self.S_values[nearest_t.item()]
     
     def value_function(self, t, x):
-        """计算新的 v(t, x) = x^T S(t) x + ∫[t,T] tr(σσ^T S(r)) dr"""
-        # 第一部分：x^T S(t) x
-        # print(self.S_values)
+        """
+        Compute the value funtion:
+            v(t, x) = x^T S(t) x + ∫[t,T] tr(σσ^T S(r)) dr
+        
+        Input: 
+            t: time
+            x: initial x
+        Output:
+            value: the control problem value v(t, x) for the given t, x
+        """
+        # First term：x^T S(t) x
         S_t = self.get_nearest_S(t)
         S_t = torch.tensor(S_t, dtype = torch.float32)
-        value = x.T @ S_t @ x
+        first_term = x.T @ S_t @ x
         
-        # 第二部分：积分项 ∫[t,T] tr(σσ^T S(r)) dr
+        # Second term: ∫[t,T] tr(σσ^T S(r)) dr
         def integrand(r):
             S_r = self.get_nearest_S(r)
             return torch.trace(self.sigma @ self.sigma.T @ S_r)
         
-        integral, _ = quad(integrand, t, self.T)  # 使用数值积分计算积分项
-        value += integral
+        # Using numerical integration to calculate the integral term
+        integral, _ = quad(integrand, t, self.T) 
+        value = first_term + integral
+
         return value
     
     def optimal_control(self, t, x):
-        """计算最优控制 a(t, x) = -D^(-1) M^T S(t) x"""
+        """
+        Compute the optimal control:
+            a(t, x) = -D^(-1) M^T S(t) x
+        
+        Input: 
+            t: time
+            x: initial x
+        Output:
+            -torch.linalg.inv(self.D) @ self.M.T @ S_t @ x: the optimal control a(t, x) for the given t, x
+        """
         S_t = self.get_nearest_S(t)
         S_t = torch.tensor(S_t, dtype = torch.float32)
+
         return -torch.linalg.inv(self.D) @ self.M.T @ S_t @ x
     
     def simulate_trajectory(self, x0, dW):
         """
-        使用 Euler 方法模拟 LQR 轨迹
+        Use Euler scheme to simulate LQR trajectory
+        Explicit Euler:
+            X_tn+1 = X_tn + dt [H X_tn - M D^{-1} M^{T} S(tn) X_tn )] + σ(W_tn+1 - W_tn ),
+
+        Input:
+            x0: Initial x
+            dW: Brownian motion
+        Output:
+            np.array(x_traj): the LQR trajectory of x for the given x0, dW
         """
         x_traj = [x0.numpy()]
         x_tn = x0
-        dt = self.T / self.N
+
         for n in range(self.N):
-            tn = n * dt
+            tn = n * self.dt
             S_tn = self.get_nearest_S(tn)
             S_tn = torch.tensor(S_tn, dtype = torch.float32)
 
-            # a = -D^{-1} M^T S x
-            control_a = -torch.linalg.inv(self.D) @self.M.T @ S_tn @ x_tn     # MC
-            # print(control_a)
+            # a_n = -D^{-1} M^T S x
+            a_n = -torch.linalg.inv(self.D) @self.M.T @ S_tn @ x_tn   
 
             # drift = Hx + Ma
-            drift = self.H @ x_tn + self.M @ control_a
-            # print(self.M @ control_a)
+            drift = self.H @ x_tn + self.M @ a_n
 
             # noise = sigma dW
             noise = self.sigma @ dW[n]
 
-            # explicit Euler scheme
-            x_next = x_tn + drift * dt + noise
+            # Upgrade by explicit Euler scheme
+            x_next = x_tn + drift * self.dt + noise
             x_tn = x_next
             x_traj.append(x_tn.numpy())
 
