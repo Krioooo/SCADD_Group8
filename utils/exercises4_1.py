@@ -408,6 +408,7 @@ def OfflineActorOnly(env, policyNN, n_episodes, lr):
         G_hat.backward()
         actor_optim.step()
 
+        print(f"[Ep {ep}/{n_episodes}] Coss = {sum(total_cost).item():.4f}, ActorGrad={G_hat.item():.4f}")
         if (ep+1) % 500 == 0:
             print(f"[Ep {ep+1}/{n_episodes}] Coss = {sum(total_cost).item():.4f}, ActorGrad={G_hat.item():.4f}")
     

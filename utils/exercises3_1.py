@@ -23,7 +23,6 @@ def Radon_Nikodym_derivative(dist_pi, dist_mu, a_n):
 
     return RN
 
-
 class SoftLQREnvironment:
     def __init__(self, H, M, C, D, R, sigma, T, N, tau, gamma):
         """
@@ -239,18 +238,24 @@ class ValueNN(nn.Module):
     def __init__(self, hidden_size = 512):
         """
         A neural network for approximating the value function V(t, x).
-        This network takes a time scalar `t` and a state vector `x` as input, 
-        concatenates them, and outputs a scalar value estimate `V`.
+        This network only takes the time variable t as input and predicts:  
+            - A symmetric positive semi-definite 2x2 matrix Q(t) representing the quadratic term x^T Q(t) x
+            - A scalar offset term c(t)
+        The final value function approximation is:
+        v(t, x) ≈ x^T Q(t) x + c(t)
 
         Parameters:
             l1 (nn.Linear): First hidden layer mapping ℝ³ → ℝ^{hidden_size}.
             l2 (nn.Linear): Second hidden layer mapping ℝ^{hidden_size} → ℝ^{hidden_size}.
-            out (nn.Linear): Output layer producing a scalar value.
+            matrix (nn.Linear): symmetric positive semi-definite matrix
+            offset (nn.Linear): scalar offset
         """
         super().__init__()
-        self.l1 = nn.Linear(3, hidden_size)
+        self.l1 = nn.Linear(1, hidden_size)
         self.l2 = nn.Linear(hidden_size, hidden_size)
-        self.out = nn.Linear(hidden_size,1)
+        self.matrix = nn.Linear(hidden_size,4) # =>2x2
+        self.offset = nn.Linear(hidden_size,1)
+        self.relu = nn.ReLU()
 
     def forward(self, t, x):
         """
@@ -261,23 +266,37 @@ class ValueNN(nn.Module):
             t: current time
             x: current x
         Output:
-            v: a estimated value v(t, x) for the given t, x.
+            quad_term + offset.squeeze(-1): a estimated value v(t, x) for the given t, x.
         """
-        input = torch.cat([t, x], dim = 1)
-        h = torch.relu(self.l1(input))
-        h = torch.relu(self.l2(h))
-        v = self.out(h).squeeze(-1)
+        if not isinstance(t, torch.Tensor):
+            t = torch.tensor([t], dtype=torch.float32)
 
-        return v
+        h = self.relu(self.l1(t))
+        h = self.relu(self.l2(h))
+        matrix = self.matrix(h)      # (batch,4)
+        offset = self.offset(h)      # (batch,1)
 
-def OfflineCriticOnly(env, valueNN, n_episodes, lr):
+        # reshape => 2x2
+        matrix_2x2 = matrix.view(-1,2,2)
+        matrix_sym = torch.bmm(matrix_2x2, matrix_2x2.transpose(1, 2))
+        # Make the matrix positive definite(存疑)
+        matrix_pd = matrix_sym + 1e-3 * torch.eye(2)
+        
+        batch_size = x.size(0)
+        x_reshaped = x.view(batch_size, 2, 1)
+        quad_term = torch.bmm(torch.bmm(x_reshaped.transpose(1,2), matrix_pd), x_reshaped).view(-1)
+
+        return quad_term + offset.squeeze(-1)
+
+def OfflineCriticOnly(env, valueNN, epoch, n_episodes, lr):
     """
     Train a value function neural network (critic) using an offline critic-only algorithm.
     
     Input:
         env: A soft LQR environment
         valueNN: Value function neural network that approximates V(t, x).
-        n_episodes: Number of training episodes.
+        epoch: Number of training episodes.
+        n_episodes: Number of episodes in one epoch.
         lr: Learning rate for the critic (valueNN). 
     Output:
         cost_history: Total running cost for every episode.
@@ -286,101 +305,82 @@ def OfflineCriticOnly(env, valueNN, n_episodes, lr):
     # Create optimizers for valueNN
     critic_optim = optim.Adam(valueNN.parameters(), lr = lr)
 
-    cost_history = []
-    criticloss = []
+    loss_list = []
+
     # Start to train
-    for ep in range(n_episodes):
+    for ep in range(epoch):
         # Sample x0
-        x0 = env.reset()
-        x_tn = x0
+        x0_batch = torch.empty(n_episodes, 2).uniform_(-2.0, 2.0)
+        loss = 0.0
+        
+        for i in range(n_episodes):
+            x0 = x0_batch[i]
+            # Simulate a trajectory
+            x_tn = x0.clone()
+            dW = torch.randn(env.N, 2) * np.sqrt(env.dt)
 
-        t_list = []
-        x_list = []
-        a_list = []
-        cost_list = []
-        logp_list = []
+            t_list = []
+            x_list = []
+            cost_list = []
 
-        # Simulate a trajectory
-        for n in range(env.N):
-            # Forward
-            tn = n * env.dt
-            S_tn = env.get_nearest_S(tn)
-            S_tn = torch.tensor(S_tn, dtype = torch.float32)
+            for n in range(env.N):
+                tn = n * env.dt
+                S_tn = env.get_nearest_S(tn)
+                S_tn = torch.tensor(S_tn, dtype = torch.float32)
 
-            # mean
-            mean= -torch.linalg.inv(env.D_eff) @ env.M.T @ S_tn @ x_tn 
-            # covarian
-            cov = env.tau * env.D_eff
-            # distribution
-            dist = MultivariateNormal(mean, cov)
-            a_n = dist.sample()
+                # mean
+                mean= -torch.linalg.inv(env.D_eff) @ env.M.T @ S_tn @ x_tn 
+                # covarian
+                cov = env.tau * env.D_eff
+                # distribution
+                dist = MultivariateNormal(mean, cov)
+                a_n = dist.sample()
 
-            # Compute log Radon-Nikodym derivative log p^θ
-            log_prob = Radon_Nikodym_derivative(dist, env.dist_mu, a_n)
+                # Use explicit euler to get new state x_tn+1
+                drift = env.H @ x_tn + env.M @ a_n
+                noise = env.sigma @ dW[n]
+                x_next = x_tn + drift * env.dt + noise
+                
+                # Compute log Radon-Nikodym derivative log p^θ
+                log_prob = Radon_Nikodym_derivative(dist, env.dist_mu, a_n)
+                # cost: f_tn
+                f_n = x_tn.T @ env.C @ x_tn + a_n.T @ env.D @ a_n
+                # running cost
+                cost_n = f_n + env.tau * log_prob
 
-            # Apply action a_n in environment
-            # cost f_tn
-            cost_n = (x_tn.T @ env.C @ x_tn) + (a_n.T @ env.D @ a_n)
+                # Store data
+                t_list.append(tn)
+                x_list.append(x_tn)
+                cost_list.append(cost_n)
 
-            # Store data
-            t_list.append(tn)
-            x_list.append(x_tn)
-            a_list.append(a_n)
-            cost_list.append(cost_n)
-            logp_list.append(log_prob)
+                # Update
+                x_tn = x_next
+            x_T = x_tn
+            # Terminal cost
+            g_T = x_T.T @ env.R @ x_T
 
-            # Use explicit euler to get new state x_tn+1
-            drift = env.H @ x_tn + env.M @ a_n
-            noise = env.sigma @ torch.randn(2) * np.sqrt(env.dt)
-            x_next = x_tn + drift * env.dt + noise
+            # Compute target term: - (sum_{k=n}^{N-1} (f_tk + τ ln pθ(αtk |tk, Xtk ))(∆t) + gtN
+            target = torch.zeros(env.N, dtype = torch.float32)
+            total = 0.0
+            for n in reversed(range(env.N)):
+                total += cost_list[n] * env.dt
+                target[n] = total
+            
+            # Compute L(η)
+            t = torch.tensor(t_list).float().view(-1,1)
+            x = torch.stack(x_list)
+            # Use value function neural network to approximate v(t, x)
+            v_n = valueNN(t, x)
+            for n in range(env.N):
+                loss += (v_n[n] - target[n] - g_T) ** 2
 
-            # Update
-            x_tn = x_next
-
-        x_T = x_tn
-        # Terminal cost
-        g_T = x_T.T @ env.R @ x_T
-
-        # Update Critic 
         critic_optim.zero_grad()
-
-        # Convert list to torch.tensor
-        t = torch.tensor(t_list).float().view(-1,1)
-        x = torch.stack(x_list)
-        cost = torch.stack(cost_list)
-        logprob = torch.stack(logp_list)
-
-        # Use value function neural network to approximate v(t, x)
-        v_n = valueNN(t, x)
-
-        # Compute running cost: f_tn + τ * ln p^θ
-        running_cost = cost + env.tau * logprob
-        # Compute total cost: running_cost + terminal cost
-        total_cost = running_cost + g_T
-        cost_history.append(sum(total_cost))
-
-        # Precompute cumulative sum
-        pre_cumsum = torch.cumsum(running_cost, dim = 0) * env.dt
-        total_cumsum = pre_cumsum[-1]
-
-        # Compute target term: - (sum_{k=n}^{N-1} (f_tk + τ ln pθ(αtk |tk, Xtk ))(∆t) + gtN )
-        targets = []
-        for n in range(env.N):
-            t_n = (total_cumsum - pre_cumsum[n]) - g_T
-            targets.append(t_n)
-        targets = torch.stack(targets, dim = 0)
-
-        # Compute L(η)
-        td = v_n - targets.detach()
-        critic_loss = (td ** 2).sum()
-        criticloss.append(critic_loss)
-        critic_loss.backward()
+        loss.backward()
         critic_optim.step()
+        loss_list.append(loss.item())
+        print(f"[Epoch {ep}/{epoch}] CriticLoss = {loss.item():.6f}")
 
-        if (ep+1) % 500 == 0:
-            print(f"[Ep {ep+1}/{n_episodes}] CriticLoss = {critic_loss.item():.6f}")
-    
-    return cost_history, criticloss
+    return loss_list
 
 def plot_criticloss(criticloss, average = True):
     """
@@ -394,38 +394,16 @@ def plot_criticloss(criticloss, average = True):
                  When set to True, the loss values are grouped into chunks of 500 steps, 
                  and the mean of each chunk is plotted.
     """
-    # critic_loss = torch.stack(criticloss)
     critic_loss = criticloss
 
-    if average == True:
-        print(1)
-        data = np.array(critic_loss) 
-        epoch_size = 500
-
-        # Ensure that the length is an integer multiple of epoch_Size
-        num_chunks = len(data) // epoch_size
-        data_trimmed = data[:num_chunks * epoch_size]
-
-        # Reshape is (num_chunks, epoch_Size), calculate the average by row
-        critic_loss = data_trimmed.reshape(-1, epoch_size).mean(axis = 1)
-
-        plt.figure(figsize = (12,5))
-        plt.plot(np.log10(critic_loss), label='Critic log Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Critic Loss(log)')
-        plt.title('Critic log of loss over epochs')
-        plt.grid()
-        plt.legend()
-        plt.show()
-    else:
-        plt.figure(figsize = (12,5))
-        plt.plot(np.log10(critic_loss), label='Critic log Loss')
-        plt.xlabel('N_episodes')
-        plt.ylabel('Critic Loss(log)')
-        plt.title('Critic log of loss over N_episodes')
-        plt.grid()
-        plt.legend()
-        plt.show()
+    plt.figure(figsize = (12,5))
+    plt.plot(np.log10(critic_loss), label='Critic log Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Critic Loss(log)')
+    plt.title('Critic log of loss over Epoch')
+    plt.grid()
+    plt.legend()
+    plt.show()
 
 def plot_value3D(t_test, data_list):
     """
