@@ -6,7 +6,6 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 from scipy.integrate import quad
-from mpl_toolkits.mplot3d import Axes3D
 
 def Radon_Nikodym_derivative(dist_pi, dist_mu, a_n):
     """
@@ -233,6 +232,73 @@ class SoftLQREnvironment:
         cost_opt_cum = torch.cumsum(cost_opt, dim = 0)
 
         return np.array(x_traj), cost_opt_cum
+    
+class PolicyNN(nn.Module):
+    def __init__(self, hidden_size = 512):
+        """
+        A neural network policy that outputs parameters of a multivariate normal distribution
+        This network maps 1D input (e.g. time index) into:
+            phi: a 2x2 matrix used in mean
+            sigma_L: a lower-triangular matrix used to build the covariance matrix Σ = L @ L.T
+
+        Parameters:
+            hidden_layer1 (nn.Linear): First fully connected hidden layer.
+            hidden_layer2 (nn.Linear): Second fully connected hidden layer.
+            dim (int): Dimensionality of the output matrix (e.g., action dimension).
+            phi (nn.Linear): Output layer to produce flattened 2x2 matrix.
+            sigma_L (nn.Linear): Output layer to produce flattened lower-triangular matrix (3 values for 2x2).
+            tri_indices (torch.Tensor): Indices to map flat elements to lower-triangular matrix.
+        """
+        super(PolicyNN, self).__init__()
+
+        self.hidden_layer1 = nn.Linear(1, hidden_size) 
+        self.hidden_layer2 = nn.Linear(hidden_size, hidden_size)
+        self.dim = 2
+
+        # Output for phi 
+        self.phi = nn.Linear(hidden_size, 2 * 2)
+        # Output for L matrix for Sigma 
+        self.sigma_L = nn.Linear(hidden_size, 2 * (2 + 1) // 2)
+
+        # Precompute 
+        self.tri_indices = torch.tril_indices(self.dim, self.dim)
+    
+    def forward(self, t, x):
+        """
+        Forward pass to get the action distribution.
+        Returns a MultivariateNormal distribution.
+
+        Input:
+            t: current time
+            x: current x
+        Output:
+            MultivariateNormal(mean, cov_matirx): a MultivariateNormal distribution with mean and covariance
+        """
+
+        # Forward pass 
+        t = t.view(-1, 1)  # Ensure t is a column vector 
+        hidden = torch.relu(self.hidden_layer1(t)) 
+        hidden = torch.sigmoid(self.hidden_layer2(hidden))
+
+        # Compute phi 
+        phi_flat = self.phi(hidden) 
+        phi = phi_flat.view(-1, self.dim, self.dim)
+
+        # Compute Sigma 
+        L_flat = self.sigma_L(hidden) 
+        # Create a lower triangular matrix L where L_flat fills the lower triangle 
+        L = torch.zeros(self.dim, self.dim) 
+        L[self.tri_indices[0], self.tri_indices[1]] = L_flat 
+        
+        # Compute Sigma = LL^T to ensure positive semi-definiteness 
+        Sigma = L @ L.T + 1e-4 * torch.eye(2).unsqueeze(0)
+
+        # mean
+        mean = phi @ x
+        # variance
+        cov_matirx = Sigma
+
+        return MultivariateNormal(mean, cov_matirx)
 
 class ValueNN(nn.Module):
     def __init__(self, hidden_size = 512):
@@ -288,101 +354,140 @@ class ValueNN(nn.Module):
 
         return quad_term + offset.squeeze(-1)
 
-def OfflineCriticOnly(env, valueNN, epoch, n_episodes, lr):
+def OfflineActorCritic(env, policyNN, valueNN, n_episodes, lr_actor = 5e-4, lr_critic = 5e-4):
     """
-    Train a value function neural network (critic) using an offline critic-only algorithm.
-    
+    Trains a policy and value network using an offline Actor-Critic algorithm with entropy regularization
+
     Input:
         env: A soft LQR environment
+        policyNN: Policy neural network that outputs a distribution given t, x.
         valueNN: Value function neural network that approximates V(t, x).
-        epoch: Number of training episodes.
-        n_episodes: Number of episodes in one epoch.
-        lr: Learning rate for the critic (valueNN). 
+        n_episodes: Number of training episodes.
+        lr_actor: Learning rate for the actor (policyNN).
+        lr_critic: Learning rate for the critic (valueNN). 
     Output:
         cost_history: Total running cost for every episode.
         criticloss: Critic loss for every episode.
     """
-    # Create optimizers for valueNN
-    critic_optim = optim.Adam(valueNN.parameters(), lr = lr)
+    # Create optimizers for policyNN and valueNN
+    actor_optim = optim.Adam(policyNN.parameters(), lr = lr_actor)
+    critic_optim = optim.Adam(valueNN.parameters(), lr = lr_critic)
 
-    loss_list = []
-
+    cost_history = []
+    criticloss = []
     # Start to train
-    for ep in range(epoch):
+    for ep in range(n_episodes):
         # Sample x0
-        x0_batch = torch.empty(n_episodes, 2).uniform_(-2.0, 2.0)
-        loss = 0.0
+        x0 = env.reset()
+        x_tn = x0
+
+        t_list = []
+        x_list = []
+        a_list = []
+        cost_list = []
+        logp_list = []
+
+        # Simulate a trajectory
+        for n in range(env.N):
+            # Forward
+            tn = n*env.dt
+            tn = torch.tensor([[tn]], dtype = torch.float32)
+            x_tn = x_tn
+
+            # Use policy neural network to output a distribution
+            dist = policyNN.forward(tn,x_tn)
+            # Sample action a_n from distribution
+            a_n = dist.sample().squeeze()
+
+            # Compute log Radon-Nikodym derivative log p^θ
+            log_prob = Radon_Nikodym_derivative(dist, env.dist_mu, a_n)
+
+            # Apply action a_n in environment
+            # cost f_tn
+            cost_n = (x_tn.T @ env.C @ x_tn) + (a_n.T @ env.D @ a_n)
+
+            # Store data
+            t_list.append(tn)
+            x_list.append(x_tn)
+            a_list.append(a_n)
+            cost_list.append(cost_n)
+            logp_list.append(log_prob)
+
+            # Use explicit euler to get new state x_tn+1
+            drift = env.H @ x_tn + env.M @ a_n
+            noise = env.sigma @ torch.randn(2) * np.sqrt(env.dt)
+            x_next = x_tn + drift * env.dt + noise
+
+            x_tn = x_next
         
-        for i in range(n_episodes):
-            x0 = x0_batch[i]
-            # Simulate a trajectory
-            x_tn = x0.clone()
-            dW = torch.randn(env.N, 2) * np.sqrt(env.dt)
+        x_T = x_tn
+        # Terminal cost
+        g_T = x_T.T @ env.R @ x_T
 
-            t_list = []
-            x_list = []
-            cost_list = []
+        # ==== Update Critic ====
+        critic_optim.zero_grad() 
+        # Convert list to torch.tensor
+        t = torch.tensor(t_list).float().view(-1,1)
+        x = torch.stack(x_list)
+        cost_n = torch.stack(cost_list)
+        logp_n = torch.stack(logp_list)
 
-            for n in range(env.N):
-                tn = n * env.dt
-                S_tn = env.get_nearest_S(tn)
-                S_tn = torch.tensor(S_tn, dtype = torch.float32)
+        # Use value function neural network to approximate v(t, x)
+        v_n = valueNN(t, x)
 
-                # mean
-                mean= -torch.linalg.inv(env.D_eff) @ env.M.T @ S_tn @ x_tn 
-                # covarian
-                cov = env.tau * env.D_eff
-                # distribution
-                dist = MultivariateNormal(mean, cov)
-                a_n = dist.sample()
+        # Compute running cost: f_tn + τ * ln p^θ
+        running_cost = cost_n + env.tau * logp_n
+        # Compute total cost: running_cost + terminal cost
+        total_cost = running_cost + g_T
+        cost_history.append(sum(total_cost))
 
-                # Use explicit euler to get new state x_tn+1
-                drift = env.H @ x_tn + env.M @ a_n
-                noise = env.sigma @ dW[n]
-                x_next = x_tn + drift * env.dt + noise
-                
-                # Compute log Radon-Nikodym derivative log p^θ
-                log_prob = Radon_Nikodym_derivative(dist, env.dist_mu, a_n)
-                # cost: f_tn
-                f_n = x_tn.T @ env.C @ x_tn + a_n.T @ env.D @ a_n
-                # running cost
-                cost_n = f_n + env.tau * log_prob
+        # Precompute cumulative sum
+        pre_cumsum = torch.cumsum(running_cost, dim = 0) * env.dt
+        total_cumsum = pre_cumsum[-1]
 
-                # Store data
-                t_list.append(tn)
-                x_list.append(x_tn)
-                cost_list.append(cost_n)
+        # Compute target term: - (sum_{k=n}^{N-1} (f_tk + τ ln pθ(αtk |tk, Xtk ))(∆t) + gtN )
+        targets = []
+        for n in range(env.N):
+            t_n = (total_cumsum - pre_cumsum[n]) - g_T
+            targets.append(t_n)
+        targets = torch.stack(targets, dim = 0)
 
-                # Update
-                x_tn = x_next
-            x_T = x_tn
-            # Terminal cost
-            g_T = x_T.T @ env.R @ x_T
-
-            # Compute target term: - (sum_{k=n}^{N-1} (f_tk + τ ln pθ(αtk |tk, Xtk ))(∆t) + gtN
-            target = torch.zeros(env.N, dtype = torch.float32)
-            total = 0.0
-            for n in reversed(range(env.N)):
-                total += cost_list[n] * env.dt
-                target[n] = total
-            
-            # Compute L(η)
-            t = torch.tensor(t_list).float().view(-1,1)
-            x = torch.stack(x_list)
-            # Use value function neural network to approximate v(t, x)
-            v_n = valueNN(t, x)
-            for n in range(env.N):
-                loss += (v_n[n] - target[n] - g_T) ** 2
-
-        critic_optim.zero_grad()
-        loss.backward()
+        # Compute L(η)
+        td = v_n - targets.detach()
+        critic_loss = (td ** 2).sum()
+        criticloss.append(critic_loss)
+        critic_loss.backward()
         critic_optim.step()
-        loss_list.append(loss.item())
-        print(f"[Epoch {ep + 1}/{epoch}] CriticLoss = {loss.item():.6f}")
 
-    return loss_list
+        # ==== Updata Actor ====
+        actor_optim.zero_grad()
 
-def plot_criticloss(criticloss):
+        # Compute v_next(t, x)
+        t_next = t + env.dt
+        x_next_list = []
+        for i in range(env.N - 1):
+            x_next_list.append(x[i + 1])
+        x_next_list.append(x_T.view(1,2)[0])
+        x_next_list = torch.stack(x_next_list, dim = 0)
+        v_np1 = valueNN(t_next, x_next_list)
+
+        # Compute inside term: ((∆vθn) + [ftn + τ ln pθ(αtn |tn, Xtn )](∆t)) .
+        inside_list = []
+        for n in range(env.N):
+            delta_v = (v_np1[n] - v_n[n]).detach()
+            inside = delta_v + running_cost[n] * env.dt
+            inside_list.append(inside)
+        inside_term = torch.stack(inside_list, dim = 0)
+        G_hat = -(inside_term * logp_n).sum()
+        G_hat.backward()
+        actor_optim.step()
+        
+        if (ep+1)%500 == 0:
+                print(f"[Ep {ep+1}/{n_episodes}] CriticLoss={critic_loss.item():.4f}, ActorLoss={G_hat.item():.4f}")
+    
+    return cost_history, criticloss
+
+def plot_criticloss(criticloss, average = True):
     """
     Plot the critic loss curve (in log10 scale) over training iterations or epochs.
     If average == True, the function averages the loss values over fixed-size chunks 
@@ -394,15 +499,121 @@ def plot_criticloss(criticloss):
                  When set to True, the loss values are grouped into chunks of 500 steps, 
                  and the mean of each chunk is plotted.
     """
-    critic_loss = criticloss
+    critic_loss = torch.stack(criticloss).tolist()
 
-    plt.figure(figsize = (12,5))
-    plt.plot(np.log10(critic_loss), label='Critic log Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Critic Loss(log)')
-    plt.title('Critic log of loss over Epoch')
-    plt.grid()
-    plt.legend()
+    if average == True:
+        data = np.array(critic_loss)  
+        epoch_size = 500
+
+        # Ensure that the length is an integer multiple of epoch_Size
+        num_chunks = len(data) // epoch_size
+        data_trimmed = data[:num_chunks * epoch_size]
+
+        # Reshape is (num_chunks, epoch_Size), calculate the average by row
+        critic_loss = data_trimmed.reshape(-1, epoch_size).mean(axis = 1)
+
+        plt.figure(figsize = (12,5))
+        plt.plot(np.log10(critic_loss), label='Critic log Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Critic Loss(log)')
+        plt.title('Critic log of loss over epochs')
+        plt.grid()
+        plt.legend()
+        plt.show()
+    else:
+        plt.figure(figsize = (12,5))
+        plt.plot(np.log10(critic_loss), label='Critic log Loss')
+        plt.xlabel('N_episodes')
+        plt.ylabel('Critic Loss(log)')
+        plt.title('Critic log of loss over N_episodes')
+        plt.grid()
+        plt.legend()
+        plt.show()
+        
+def training_test(env, policyNN, x0, dW):
+    """
+    Simulate one trajectory using the learned policy,
+    and computes the cumulative cost over time.
+
+    Input:
+        env: A soft LQR environment
+        policyNN: Policy neural network that outputs a distribution given t, x.
+        x0: Initial state
+        dW: Brownian motion
+    Output:
+        x_traj_learn: The simulated state trajectory under the learned policy.
+        cost_learn_cum: The cumulative cost at each time step, including the terminal cost.
+    """
+    x_tn = x0.clone()
+    x_traj_learn = []    
+    cost_learn = []   
+    for n in range(env.N):
+        tn = n * env.dt
+        tn = torch.tensor([tn], dtype=torch.float32)
+        # Use policy neural network to output a distribution
+        dist = policyNN.forward(tn, x_tn)    
+        # Sample action a_n from distribution
+        a_n = dist.sample().squeeze()
+        
+        # cost f_tn
+        cost_n = (x_tn.T @ env.C @ x_tn) + (a_n.T @ env.D @ a_n)
+        # Compute log Radon-Nikodym derivative log p^θ
+        log_prob = Radon_Nikodym_derivative(dist, env.dist_mu, a_n)
+        # Compute running cost: f_tn + τ * ln p^θ
+        running_cost_n = cost_n + env.tau * log_prob
+        cost_learn.append(running_cost_n)
+
+        # Use explicit euler to get new state x_tn+1
+        drift = env.H @ x_tn + env.M @ a_n
+        noise = env.sigma @ dW[n]
+        x_next = x_tn + drift * env.dt + noise
+        x_traj_learn.append(x_tn.numpy())
+        x_tn = x_next
+    # Terminal cost
+    g_T = x_tn.T @ env.R @ x_tn
+    cost_learn.append(g_T.unsqueeze(0))
+
+    x_traj_learn = np.array(x_traj_learn)
+    cost_learn = torch.stack(cost_learn)
+    cost_learn_cum = torch.cumsum(cost_learn, dim = 0)
+
+    return x_traj_learn, cost_learn_cum
+
+def plot_trajectory_cost(initial_states, env, Actor, dW):
+    """
+    Plot state trajectories and cumulative costs over time for multiple initial states,
+    comparing the learned offline Actor-Critic policy with the theoretical optimal solution.
+
+    Input:
+        initial_states: A list of initial state
+        env: A soft LQR environment
+        Actor: Policy neural network that outputs a distribution given t, x.
+        dW: Brownian motion
+    """
+    fig, axes = plt.subplots(nrows = 4, ncols = 2, figsize = (10, 12))
+
+    for i, x0 in enumerate(initial_states):
+        x_traj_learn, cost_learn_cum = training_test(env, Actor, x0, dW)
+        x_traj_optim, cost_optim_cum = env.simulate_trajectory(x0, dW)
+
+        axes[i, 0].plot(x_traj_learn[:,0], x_traj_learn[:,1], label = "Learned Offline AC")
+        axes[i, 0].plot(x_traj_optim[:,0], x_traj_optim[:,1], label = "Theoretical Optimal")
+        axes[i, 0].scatter(x0[0].item(),x0[1].item(), color = 'green', s = 40, label = "Initial State")
+        axes[i, 0].set_xlabel("x1")
+        axes[i, 0].set_ylabel("x2")
+        axes[i, 0].set_title(f"Trajectory from Initial State [{x0[0].item()},{x0[1].item()}]")
+        axes[i, 0].legend()
+        axes[i, 0].grid()
+
+        axes[i, 1].plot(env.time_grid, cost_learn_cum.detach().numpy(), label = "Learned Offline AC")
+        axes[i, 1].plot(env.time_grid, cost_optim_cum, label = "Theoretical Optimal")
+        axes[i, 1].set_xlabel("Time")
+        axes[i, 1].set_ylabel("Cost")
+        axes[i, 1].set_title(f"Cost Over Time from Initial State [{x0[0].item()},{x0[1].item()}]")
+        axes[i, 1].legend()
+        axes[i, 1].grid()
+    
+    plt.tight_layout()
     plt.show()
 
 def plot_value3D(t_test, data_list):
@@ -469,3 +680,4 @@ def find_maximum_error(env, valueNN, t_test, x_range):
         data_list.append(data)
     print(f"Max error on specified grid: {max_error:.2f}")
     return data_list
+
